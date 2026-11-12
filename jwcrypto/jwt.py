@@ -168,7 +168,8 @@ class JWT:
 
     def __init__(self, header=None, claims=None, jwt=None, key=None,
                  algs=None, default_claims=None, check_claims=None,
-                 expected_type=None, strict_serialization=False):
+                 expected_type=None, strict_serialization=False,
+                 header_registry=None):
         """Creates a JWT object.
 
         :param header: A dict or a JSON string with the JWT Header data.
@@ -197,6 +198,15 @@ class JWT:
          so only the compact representation is accepted. The default is
          False to preserve backwards compatibility. It has no effect on
          token creation, which always produces the compact serialization.
+        :param header_registry: An optional dict of
+         :class:`jwcrypto.common.JWSEHeaderParameter` entries with
+         additional JOSE header parameters the caller supports. The
+         registry additions are threaded through to the JWS or JWE
+         tokens created by this object, so critical ('crit') extension
+         headers are validated against the same registry when the
+         token is deserialized or verified, including when nested
+         tokens are processed with a JWT object created with the same
+         registry.
 
         Note: either the header,claims or jwt,key parameters should be
         provided as a deserialization operation (which occurs if the jwt
@@ -220,6 +230,7 @@ class JWT:
         self.deserializelog = None
         self._expected_type = expected_type
         self._strict_serialization = strict_serialization
+        self._header_registry = header_registry
 
         if header:
             self.header = header
@@ -616,7 +627,7 @@ class JWT:
         :param key: A (:class:`jwcrypto.jwk.JWK`) key.
         """
 
-        t = JWS(self.claims)
+        t = JWS(self.claims, header_registry=self._header_registry)
         if self._algs:
             t.allowed_algs = self._algs
         t.add_signature(key, protected=self.header)
@@ -633,7 +644,8 @@ class JWT:
         :param key: A (:class:`jwcrypto.jwk.JWK`) key.
         """
 
-        t = JWE(self.claims, self.header)
+        t = JWE(self.claims, self.header,
+                header_registry=self._header_registry)
         if self._algs:
             t.allowed_algs = self._algs
         t.add_recipient(key)
@@ -719,9 +731,9 @@ class JWT:
 
         data = jwt.count('.')
         if data == 2:
-            self.token = JWS()
+            self.token = JWS(header_registry=self._header_registry)
         elif data == 4:
-            self.token = JWE()
+            self.token = JWE(header_registry=self._header_registry)
         else:
             raise ValueError("Token format unrecognized")
 

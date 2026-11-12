@@ -3095,3 +3095,274 @@ class TestCommonHeaderFunctions(unittest.TestCase):
              'crit': JWSEHeaderParameter('Crit', True, True, None)})
         merged = merge_and_check_headers(p, None, registry=reg)
         self.assertEqual(merged['kid'], 'key1')
+
+
+class TestNestedJOSEExtensionHeaders(unittest.TestCase):
+    """Tests that caller-supported JOSE extension headers are threaded
+    through JWS, JWE and JWT, and that nested tokens carrying 'crit'
+    headers are checked against the same registry at the outermost
+    deserialization or verification step."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sigkey = jwk.JWK.generate(kty='oct', size=256)
+        cls.enckey = jwk.JWK.generate(kty='oct', size=256)
+
+    @staticmethod
+    def ext_registry(check_fn=None):
+        return {'custom1': JWSEHeaderParameter('Custom header 1',
+                                               True, True, check_fn)}
+
+    @staticmethod
+    def sig_header(value='custom_val'):
+        return {'alg': 'HS256', 'crit': ['custom1'], 'custom1': value}
+
+    @staticmethod
+    def enc_header(value='custom_val'):
+        return {'alg': 'dir', 'enc': 'A256GCM',
+                'crit': ['custom1'], 'custom1': value}
+
+    def make_signed_jwt(self, claims, header=None, registry=None):
+        t = jwt.JWT(header or self.sig_header(), claims,
+                    header_registry=registry)
+        t.make_signed_token(self.sigkey)
+        return t.serialize()
+
+    def make_encrypted_jwt(self, claims, header=None, registry=None):
+        t = jwt.JWT(header or self.enc_header(), claims,
+                    header_registry=registry)
+        t.make_encrypted_token(self.enckey)
+        return t.serialize()
+
+    def test_jwt_threads_registry_signed(self):
+        reg = self.ext_registry()
+        token = self.make_signed_jwt({'sub': 'test'}, registry=reg)
+
+        # Default policy: unknown critical header is rejected
+        with self.assertRaises(jws.InvalidJWSSignature):
+            jwt.JWT(jwt=token, key=self.sigkey)
+
+        # Same token accepted with the caller registry, header readable
+        t = jwt.JWT(jwt=token, key=self.sigkey, header_registry=reg)
+        self.assertEqual(json_decode(t.header)['custom1'], 'custom_val')
+        self.assertEqual(json_decode(t.claims)['sub'], 'test')
+
+    def test_jwt_threads_registry_encrypted(self):
+        reg = self.ext_registry()
+        token = self.make_encrypted_jwt({'sub': 'test'}, registry=reg)
+
+        with self.assertRaises(jwe.InvalidJWEData):
+            jwt.JWT(jwt=token, key=self.enckey, expected_type='JWE')
+
+        t = jwt.JWT(jwt=token, key=self.enckey, expected_type='JWE',
+                    header_registry=reg)
+        self.assertEqual(json_decode(t.header)['custom1'], 'custom_val')
+        self.assertEqual(json_decode(t.claims)['sub'], 'test')
+
+    def test_nested_jws_in_jwe(self):
+        reg = self.ext_registry()
+        inner = self.make_signed_jwt({'sub': 'nested'}, registry=reg)
+        outer_header = self.enc_header('outer')
+        outer_header['cty'] = 'JWT'
+        outer = self.make_encrypted_jwt(inner, outer_header, registry=reg)
+
+        # The outer layer enforces the default reject policy
+        with self.assertRaises(jwe.InvalidJWEData):
+            jwt.JWT(jwt=outer, key=self.enckey, expected_type='JWE')
+
+        touter = jwt.JWT(jwt=outer, key=self.enckey, expected_type='JWE',
+                         header_registry=reg)
+        self.assertEqual(json_decode(touter.header)['custom1'], 'outer')
+
+        # The nested token is checked against the same registry
+        with self.assertRaises(jws.InvalidJWSSignature):
+            jwt.JWT(jwt=touter.claims, key=self.sigkey)
+        tinner = jwt.JWT(jwt=touter.claims, key=self.sigkey,
+                         header_registry=reg)
+        self.assertEqual(json_decode(tinner.header)['custom1'],
+                         'custom_val')
+        self.assertEqual(json_decode(tinner.claims)['sub'], 'nested')
+
+    def test_nested_jwe_in_jws(self):
+        reg = self.ext_registry()
+        inner = self.make_encrypted_jwt({'sub': 'nested'}, registry=reg)
+        outer_header = self.sig_header('outer')
+        outer_header['cty'] = 'JWT'
+        outer = self.make_signed_jwt(inner, outer_header, registry=reg)
+
+        with self.assertRaises(jws.InvalidJWSSignature):
+            jwt.JWT(jwt=outer, key=self.sigkey)
+
+        touter = jwt.JWT(jwt=outer, key=self.sigkey, header_registry=reg)
+        self.assertEqual(json_decode(touter.header)['custom1'], 'outer')
+
+        with self.assertRaises(jwe.InvalidJWEData):
+            jwt.JWT(jwt=touter.claims, key=self.enckey,
+                    expected_type='JWE')
+        tinner = jwt.JWT(jwt=touter.claims, key=self.enckey,
+                         expected_type='JWE', header_registry=reg)
+        self.assertEqual(json_decode(tinner.header)['custom1'],
+                         'custom_val')
+        self.assertEqual(json_decode(tinner.claims)['sub'], 'nested')
+
+    def test_nested_malicious_inner_crit(self):
+        # Sign a plain inner token, then tamper the protected header to
+        # add an unknown critical extension header
+        s = jws.JWS(b'inner')
+        s.add_signature(self.sigkey, protected={'alg': 'HS256'})
+        parts = s.serialize(compact=True).split('.')
+        p = json_decode(base64url_decode(parts[0]))
+        p['crit'] = ['urn:evil']
+        p['urn:evil'] = True
+        parts[0] = base64url_encode(json_encode(p))
+        inner = '.'.join(parts)
+
+        reg = self.ext_registry()
+        outer = self.make_encrypted_jwt(inner, registry=reg)
+        touter = jwt.JWT(jwt=outer, key=self.enckey, expected_type='JWE',
+                         header_registry=reg)
+
+        # The unknown critical header is stably rejected, with and
+        # without the caller registry
+        for _ in range(2):
+            with self.assertRaises(jws.InvalidJWSSignature):
+                jwt.JWT(jwt=touter.claims, key=self.sigkey,
+                        header_registry=reg)
+            with self.assertRaises(jws.InvalidJWSSignature):
+                jwt.JWT(jwt=touter.claims, key=self.sigkey)
+
+    def test_crit_in_unprotected_header_rejected(self):
+        reg = self.ext_registry()
+        s = jws.JWS(b'test', header_registry=reg)
+        s.add_signature(self.sigkey,
+                        protected={'alg': 'HS256', 'custom1': 'custom_val'})
+        obj = json_decode(s.serialize())
+        # Move the crit list to the unprotected header
+        obj['header'] = {'crit': ['custom1']}
+        raw = json_encode(obj)
+
+        s2 = jws.JWS(header_registry=reg)
+        s2.deserialize(raw)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            s2.verify(self.sigkey)
+
+    def test_unknown_crit_rejected_at_creation(self):
+        reg = self.ext_registry()
+        s = jws.JWS(b'test', header_registry=reg)
+        with self.assertRaises(jws.InvalidJWSObject):
+            s.add_signature(self.sigkey,
+                            protected={'alg': 'HS256',
+                                       'crit': ['unknown_hdr'],
+                                       'unknown_hdr': 'x'})
+
+        e = jwe.JWE(b'test',
+                    protected={'alg': 'dir', 'enc': 'A256GCM',
+                               'crit': ['unknown_hdr'], 'unknown_hdr': 'x'},
+                    header_registry=reg)
+        with self.assertRaises(jwe.InvalidJWEData):
+            e.add_recipient(self.enckey)
+
+    def test_malformed_crit_rejected(self):
+        reg = self.ext_registry()
+        # crit must be a non-empty list
+        for bad_crit in ('custom1', [], 123):
+            s = jws.JWS(b'test', header_registry=reg)
+            with self.assertRaises(jws.InvalidJWSObject):
+                s.add_signature(self.sigkey,
+                                protected={'alg': 'HS256',
+                                           'crit': bad_crit,
+                                           'custom1': 'custom_val'})
+        # crit entries must name a header present in the token
+        s = jws.JWS(b'test', header_registry=reg)
+        with self.assertRaises(jws.InvalidJWSObject):
+            s.add_signature(self.sigkey,
+                            protected={'alg': 'HS256',
+                                       'crit': ['custom1']})
+        # crit entries must be strings
+        s = jws.JWS(b'test', header_registry=reg)
+        with self.assertRaises(jws.InvalidJWSObject):
+            s.add_signature(self.sigkey,
+                            protected={'alg': 'HS256',
+                                       'crit': [123],
+                                       'custom1': 'custom_val'})
+
+    def test_unsupported_crit_rejected(self):
+        reg = {'custom2': JWSEHeaderParameter('Custom header 2',
+                                              True, False, None)}
+        s = jws.JWS(b'test', header_registry=reg)
+        with self.assertRaises(jws.InvalidJWSObject):
+            s.add_signature(self.sigkey,
+                            protected={'alg': 'HS256',
+                                       'crit': ['custom2'],
+                                       'custom2': 'x'})
+
+    def test_b64_check_not_bypassed(self):
+        reg = self.ext_registry()
+        # A non-boolean b64 header is rejected at deserialization even
+        # when the custom critical header is known to the registry
+        s = jws.JWS(b'test', header_registry=reg)
+        s.add_signature(self.sigkey,
+                        protected={'alg': 'HS256', 'b64': False,
+                                   'crit': ['b64', 'custom1'],
+                                   'custom1': 'custom_val'})
+        parts = s.serialize(compact=True).split('.')
+        p = json_decode(base64url_decode(parts[0]))
+        p['b64'] = 'yes'
+        parts[0] = base64url_encode(json_encode(p))
+        tampered = '.'.join(parts)
+
+        s2 = jws.JWS(header_registry=reg)
+        with self.assertRaises(jws.InvalidJWSObject):
+            s2.deserialize(tampered)
+
+    def test_alg_check_not_bypassed(self):
+        reg = self.ext_registry()
+        token = self.make_signed_jwt({'sub': 'test'}, registry=reg)
+        s = jws.JWS(header_registry=reg)
+        s.deserialize(token)
+        # The known extension header does not weaken the alg checks
+        with self.assertRaises(jws.InvalidJWSSignature):
+            s.verify(self.sigkey, alg='HS512')
+        with self.assertRaises(jws.InvalidJWSSignature):
+            jwt.JWT(jwt=token, key=self.sigkey, algs=['HS512'],
+                    header_registry=reg)
+
+    def test_check_fn_enforced_on_verify(self):
+        def chk(jwobj):
+            return jwobj.jose_header['custom1'] == 'custom_val'
+
+        reg = self.ext_registry(chk)
+        token = self.make_signed_jwt({'sub': 'test'}, registry=reg)
+        jwt.JWT(jwt=token, key=self.sigkey, header_registry=reg)
+
+        bad = self.make_signed_jwt({'sub': 'test'},
+                                   header=self.sig_header('wrong'),
+                                   registry=reg)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            jwt.JWT(jwt=bad, key=self.sigkey, header_registry=reg)
+
+    def test_serialization_roundtrip(self):
+        reg = self.ext_registry()
+        # JWS compact and JSON serializations both carry the extension
+        s = jws.JWS(b'roundtrip', header_registry=reg)
+        s.add_signature(self.sigkey,
+                        protected={'alg': 'HS256', 'crit': ['custom1'],
+                                   'custom1': 'custom_val'})
+        for raw in (s.serialize(compact=True), s.serialize()):
+            s2 = jws.JWS(header_registry=reg)
+            s2.deserialize(raw, self.sigkey)
+            self.assertEqual(s2.payload, b'roundtrip')
+            self.assertEqual(s2.jose_header['custom1'], 'custom_val')
+
+        # JWE compact and JSON serializations as well
+        e = jwe.JWE(b'roundtrip',
+                    protected={'alg': 'dir', 'enc': 'A256GCM',
+                               'crit': ['custom1'],
+                               'custom1': 'custom_val'},
+                    header_registry=reg)
+        e.add_recipient(self.enckey)
+        for raw in (e.serialize(compact=True), e.serialize()):
+            e2 = jwe.JWE(header_registry=reg)
+            e2.deserialize(raw, self.enckey)
+            self.assertEqual(e2.payload, b'roundtrip')
+            self.assertEqual(e2.jose_header['custom1'], 'custom_val')
